@@ -58,7 +58,14 @@ const log = (...args) => {
   console.log('[spike]', ...args)
   logEl.textContent += args.join(' ') + '\n'
 }
-const rid = (prefix) => `${prefix}-${crypto.randomUUID().slice(0, 8)}`
+// AIDEV-NOTE: crypto.randomUUID requires a secure context (HTTPS/localhost);
+// crypto.getRandomValues works everywhere, so use it for the short random suffix.
+const rid = (prefix) => {
+  const bytes = new Uint8Array(4)
+  crypto.getRandomValues(bytes)
+  const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')
+  return `${prefix}-${hex}`
+}
 const params = new URLSearchParams(location.search)
 
 // AIDEV-NOTE: topology decision — STAR, never mesh. The teacher is the hub;
