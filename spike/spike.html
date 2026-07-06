@@ -210,7 +210,8 @@ function teacher () {
 
 // Doc naming convention shared by both roles. Today each student brings one
 // doc; later the same channel also carries e.g. 'class:template'.
-const docIdFor = (studentId) => `student:${studentId}`
+// (Function declaration: hoisted above the role dispatch at the top.)
+function docIdFor (studentId) { return `student:${studentId}` }
 
 /* ------------------------------ student ------------------------------ */
 
