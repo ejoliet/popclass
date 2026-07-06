@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<!--
+  spike.html — popclass spike: N students sync Yjs docs to one teacher
+  over PeerJS DataChannels. Open with no query params to be the teacher;
+  open the join link (?room=<id>) to be a student.
+
+  Serve over http (e.g. `python3 -m http.server`) — ES modules don't load
+  from file://.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>popclass spike — yjs over peerjs (star)</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.2rem; }
+  textarea { width: 100%; min-height: 8rem; font: 0.9rem/1.4 ui-monospace, monospace; box-sizing: border-box; }
+  .card { border: 1px solid #8884; border-radius: 8px; padding: 0.75rem 1rem; margin: 1rem 0; }
+  .card h2 { font-size: 1rem; margin: 0 0 0.5rem; display: flex; justify-content: space-between; }
+  .status { font-weight: normal; font-size: 0.85rem; }
+  .status.on { color: #2a2; } .status.off { color: #c33; }
+  code, .joinlink { user-select: all; word-break: break-all; }
+  #log { font: 0.75rem/1.4 ui-monospace, monospace; color: #888; white-space: pre-wrap; margin-top: 2rem; }
+</style>
+</head>
+<body>
+<h1 id="title">popclass spike</h1>
+<div id="app"></div>
+<div id="log"></div>
+
+<!-- Pinned CDN deps. PeerJS ships UMD (window.Peer); yjs is imported as an
+     ES module below and MUST be the same URL as in provider.js so both
+     files share one yjs instance (two instances break instanceof checks). -->
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js"></script>
+<script type="module">
+import * as Y from 'https://esm.sh/yjs@13.6.31'
+import {
+  YChannelProvider, MSG_CONTROL,
+  decodeFrame, encodeControl, decodeControl
+} from './provider.js'
+
+// AIDEV-NOTE: signaling/TURN stays injectable, never hardcoded. Free tier
+// runs on the PeerJS public cloud (empty options object = their default
+// 0.peerjs.com). Premium tier later swaps in self-hosted PeerServer + TURN
+// by filling this object (host/port/path/key + config.iceServers) — no
+// other code changes. Override at runtime via window.POPCLASS_PEER_OPTIONS.
+const PEER_OPTIONS = window.POPCLASS_PEER_OPTIONS ?? {
+  // host: 'signal.popclass.example', port: 443, secure: true, key: '...',
+  // config: { iceServers: [{ urls: 'turn:...', username: '...', credential: '...' }] },
+  debug: 1
+}
+
+const app = document.getElementById('app')
+const logEl = document.getElementById('log')
+const log = (...args) => {
+  console.log('[spike]', ...args)
+  logEl.textContent += args.join(' ') + '\n'
+}
+const rid = (prefix) => `${prefix}-${crypto.randomUUID().slice(0, 8)}`
+const params = new URLSearchParams(location.search)
+
+// AIDEV-NOTE: topology decision — STAR, never mesh. The teacher is the hub;
+// students call peer.connect(<teacher peer id>) and nothing else. Students
+// never learn each other's peer ids (the room id is the only id shared, and
+// it belongs to the teacher), so student<->student links are impossible by
+// construction, not by policy. This caps connection count at N (not N²),
+// keeps the teacher the single replica holder, and matches the future
+// product model where the teacher machine is the classroom's data plane.
+if (params.has('room')) student(params.get('room'))
+else teacher()
+
+// Adapt a PeerJS DataConnection to the dataChannelLike shape provider.js
+// expects. This is the ONLY place PeerJS specifics leak; a raw
+// RTCDataChannel gets an equivalent ~15-line wrapper later.
+function wrapConnection (conn) {
+  const on = (event, set) => (fn) => {
+    set.add(fn); return () => set.delete(fn)
+  }
+  const msg = new Set(); const open = new Set(); const close = new Set()
+  conn.on('data', (data) => {
+    // PeerJS binarypack may hand us an ArrayBuffer instead of Uint8Array.
+    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data)
+    msg.forEach(fn => fn(bytes))
+  })
+  conn.on('open', () => open.forEach(fn => fn()))
+  conn.on('close', () => close.forEach(fn => fn()))
+  conn.on('error', (err) => { log('conn error:', err.type ?? err); close.forEach(fn => fn()) })
+  return {
+    send: (bytes) => conn.send(bytes),
+    isOpen: () => conn.open,
+    onMessage: on('data', msg),
+    onOpen: on('open', open),
+    onClose: on('close', close)
+  }
+}
+
+function makePeer (id) {
+  const peer = new Peer(id, PEER_OPTIONS)
+  peer.on('error', (err) => log('peer error:', err.type))
+  // Signaling-server drop ≠ data loss: DataChannels keep flowing; reconnect
+  // so future joins/re-joins can still be brokered.
+  peer.on('disconnected', () => { if (!peer.destroyed) peer.reconnect() })
+  return peer
+}
+
+/* ------------------------------ teacher ------------------------------ */
+
+function teacher () {
+  document.getElementById('title').textContent = 'popclass spike — teacher'
+  // Keep the room id stable across teacher refreshes by parking it in the
+  // URL (no localStorage in this spike). Students hold the same room id in
+  // their join link, so after a refresh they can find us again.
+  const roomId = params.get('host') ?? rid('popclass')
+  if (!params.has('host')) {
+    history.replaceState(null, '', `${location.pathname}?host=${roomId}`)
+  }
+
+  app.innerHTML = `
+    <div class="card">
+      <p>Room: <code>${roomId}</code></p>
+      <p>Join link: <a class="joinlink" id="joinlink" href=""></a></p>
+    </div>
+    <div id="students"><p><em>Waiting for students…</em></p></div>`
+  const joinUrl = `${location.origin}${location.pathname}?room=${roomId}`
+  const joinlink = document.getElementById('joinlink')
+  joinlink.href = joinUrl
+  joinlink.textContent = joinUrl
+  const studentsEl = document.getElementById('students')
+
+  // Per-student state, keyed by stable studentId (not peer id — peer ids
+  // change every reconnect). Y.Docs live here for the teacher's lifetime,
+  // so a returning student resyncs from our replica.
+  const students = new Map() // studentId -> { docs: Map<docId, Y.Doc>, providers, card, setStatus }
+
+  const peer = makePeer(roomId)
+  peer.on('open', () => log('teacher peer open:', roomId))
+  peer.on('error', (err) => {
+    // After a fast refresh the public cloud may still hold our old session.
+    if (err.type === 'unavailable-id') {
+      log('room id still held by old session, retrying in 2s')
+      setTimeout(() => location.reload(), 2000)
+    }
+  })
+
+  peer.on('connection', (conn) => {
+    const channel = wrapConnection(conn)
+    // First frame from a student is a MSG_CONTROL hello listing its docIds.
+    // Handling it synchronously matters: the student's SYNC_STEP1 is already
+    // queued behind it on the (ordered) channel, so providers must exist
+    // before this handler returns.
+    const unsub = channel.onMessage((bytes) => {
+      const frame = decodeFrame(bytes)
+      if (frame.msgType !== MSG_CONTROL) return
+      unsub()
+      const hello = decodeControl(frame.payload)
+      log('student connected:', hello.studentId, 'docs:', hello.docIds.join(','))
+      attachStudent(hello, conn, channel)
+    })
+  })
+
+  function attachStudent ({ studentId, docIds }, conn, channel) {
+    let s = students.get(studentId)
+    if (!s) {
+      s = { docs: new Map(), providers: [], conn: null, setStatus: null }
+      students.set(studentId, s)
+      for (const docId of docIds) s.docs.set(docId, new Y.Doc())
+      if (students.size === 1) studentsEl.innerHTML = ''
+      renderStudentCard(s, studentId, docIds[0])
+    }
+    // Returning student on a fresh connection: drop the old one. Their
+    // Y.Docs survive in `students`, so resync restores their text.
+    for (const p of s.providers) p.destroy()
+    s.providers = []
+    if (s.conn && s.conn !== conn && s.conn.open) s.conn.close()
+    s.conn = conn
+    s.setStatus(true)
+    channel.onClose(() => { if (s.conn === conn) s.setStatus(false) })
+
+    for (const docId of docIds) {
+      if (!s.docs.has(docId)) s.docs.set(docId, new Y.Doc())
+      // AIDEV-NOTE: teacher NEVER writes to student docs in this spike. The
+      // provider itself is symmetric (it would happily relay teacher edits);
+      // read-only is enforced at the UI layer: the replica <textarea> below
+      // is disabled and we never call ytext.insert() on the teacher side.
+      s.providers.push(new YChannelProvider(s.docs.get(docId), channel, docId))
+    }
+  }
+
+  function renderStudentCard (s, studentId, primaryDocId) {
+    const card = document.createElement('div')
+    card.className = 'card'
+    card.innerHTML = `
+      <h2><span>${studentId}</span> <span class="status"></span></h2>
+      <textarea disabled placeholder="(student has not typed yet)"></textarea>`
+    studentsEl.append(card)
+    const statusEl = card.querySelector('.status')
+    s.setStatus = (on) => {
+      statusEl.textContent = on ? 'connected' : 'disconnected'
+      statusEl.className = `status ${on ? 'on' : 'off'}`
+    }
+    // Read-only render of the student's Y.Text.
+    const ta = card.querySelector('textarea')
+    const ytext = s.docs.get(primaryDocId).getText('scratch')
+    ytext.observe(() => { ta.value = ytext.toString() })
+    ta.value = ytext.toString()
+  }
+}
+
+// Doc naming convention shared by both roles. Today each student brings one
+// doc; later the same channel also carries e.g. 'class:template'.
+const docIdFor = (studentId) => `student:${studentId}`
+
+/* ------------------------------ student ------------------------------ */
+
+function student (roomId) {
+  document.getElementById('title').textContent = 'popclass spike — student'
+  // Stable student identity without localStorage: mint an id on first load
+  // and pin it into the URL. Reopening the same URL (history, ctrl+shift+t,
+  // pasted link) reuses the id, so the teacher hands back our doc replica.
+  const studentId = params.get('sid') ?? rid('stu')
+  if (!params.has('sid')) {
+    history.replaceState(null, '', `${location.pathname}?room=${roomId}&sid=${studentId}`)
+  }
+  const docId = docIdFor(studentId)
+
+  app.innerHTML = `
+    <div class="card">
+      <h2><span>${studentId}</span> <span class="status off">connecting…</span></h2>
+      <textarea id="pad" placeholder="Type here — the teacher sees this live."></textarea>
+      <p><small>Room <code>${roomId}</code> — keep this exact URL to rejoin as the same student.</small></p>
+    </div>`
+  const statusEl = app.querySelector('.status')
+  const ta = document.getElementById('pad')
+  const setStatus = (text, on) => {
+    statusEl.textContent = text
+    statusEl.className = `status ${on ? 'on' : 'off'}`
+  }
+
+  const ydoc = new Y.Doc()
+  const ytext = ydoc.getText('scratch')
+
+  // Two-way textarea<->Y.Text binding. The student is the only writer of
+  // this doc (teacher is read-only), so whole-value replace inside one
+  // transaction is safe — no concurrent-edit merging needed in this spike.
+  ta.addEventListener('input', () => {
+    ydoc.transact(() => {
+      ytext.delete(0, ytext.length)
+      ytext.insert(0, ta.value)
+    })
+  })
+  ytext.observe((_e, tx) => {
+    if (tx.local) return
+    const { selectionStart, selectionEnd } = ta
+    ta.value = ytext.toString()
+    ta.setSelectionRange(selectionStart, selectionEnd) // spike-grade cursor keep
+  })
+
+  const peer = makePeer(rid(`${studentId}-conn`)) // fresh peer id per page load is fine; sid is the identity
+  let provider = null
+  let attempt = 0
+
+  // AIDEV-NOTE: reconnect logic (student side) — students own reconnection
+  // because they are the source of truth for their docs and the teacher's
+  // address (room id) is stable while student peer ids are not. On close we
+  // redial the SAME room id with exponential backoff + jitter (1s→30s cap).
+  // Covers both directions of failure:
+  //   - student tab killed/reopened: fresh page dials in, teacher resyncs
+  //     the replica back down via the state-vector handshake;
+  //   - teacher refreshed: our conn closes, we keep redialing until the
+  //     teacher reclaims the room id, then push our full doc back up.
+  const connect = () => {
+    setStatus(attempt === 0 ? 'connecting…' : `reconnecting (try ${attempt + 1})…`, false)
+    const conn = peer.connect(roomId, { reliable: true })
+    const channel = wrapConnection(conn)
+    let closed = false
+    channel.onOpen(() => {
+      attempt = 0
+      setStatus('connected', true)
+      log('connected to teacher')
+      // Hello must precede the provider's SYNC_STEP1 (ordered channel), so
+      // the teacher can create its side of the provider before step 1 lands.
+      channel.send(encodeControl({ studentId, docIds: [docId] }))
+      provider?.destroy()
+      provider = new YChannelProvider(ydoc, channel, docId)
+    })
+    channel.onClose(() => {
+      if (closed) return
+      closed = true
+      const delay = Math.min(30_000, 1000 * 2 ** attempt++) + Math.random() * 500
+      setStatus(`disconnected — retrying in ${Math.round(delay / 1000)}s`, false)
+      log(`connection closed, retry in ${Math.round(delay)}ms`)
+      setTimeout(connect, delay)
+    })
+  }
+  peer.on('open', connect)
+}
+</script>
+</body>
+</html>
